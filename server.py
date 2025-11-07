@@ -1,258 +1,244 @@
-"""
-AR Air Paint - Single Window Version (Fixed Canvas & Improved Shape Logic)
-Features:
-- Draw directly on live video feed
-- Brush types: normal, dotted, calligraphy
-- Adjustable brush/eraser size
-- Color palette
-- Shape insertion: rectangle, circle, line (with preview)
-- Undo / Redo
-- Save / Load
-- Gesture-based controls using MediaPipe
-"""
-
+# server.py
+import streamlit as st
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
 import cv2
 import numpy as np
 import mediapipe as mp
-from collections import deque
-import os
+import threading
+import time
+from av import VideoFrame
 
-# Config
-CAM_WIDTH = 1280
-CAM_HEIGHT = 720
-HISTORY_LIMIT = 20
+st.set_page_config(page_title="AirDraw (Streamlit)", layout="wide")
 
-# MediaPipe hands
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+st.title("AirDraw — Streamlit / OpenCV-style Demo")
+st.write("Gesture-driven drawing. Uses MediaPipe (hands) and OpenCV. Note: camera runs in the browser via WebRTC.")
 
-# Undo/redo
-history = deque(maxlen=HISTORY_LIMIT)
-redo_stack = []
+# Simple UI controls (left column)
+with st.sidebar:
+    st.header("Controls")
+    brush_size = st.slider("Brush size", min_value=2, max_value=60, value=8)
+    color_hex = st.color_picker("Brush color", "#ff3b30")
+    tool = st.radio("Tool", ("Brush", "Eraser"))
+    if st.button("Save current drawing"):
+        st.session_state.get("save_request", 0)
+        st.session_state.save_request = (st.session_state.get("save_request", 0) + 1)
+    if st.button("Clear drawing"):
+        st.session_state.clear_request = (st.session_state.get("clear_request", 0) + 1)
+    st.write("---")
+    st.write("Tip: index finger up to draw. Two fingers to select UI (client-side).")
 
-# Drawing state
-xp, yp = None, None
-color = (0, 0, 255)
-brush_size = 8
-eraser_size = 60
-tool = 'brush'
-brush_type = 'normal'
-shape_type = None
-shape_start = None
-drawing_shape = False
+# Global RTC config (optional TURN/STUN)
+RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
 
-# UI
-PALETTE = [
-    {'name': 'black', 'bgr': (0, 0, 0), 'rect': (20, 20, 100, 100)},
-    {'name': 'red', 'bgr': (0, 0, 255), 'rect': (130, 20, 210, 100)},
-    {'name': 'green', 'bgr': (0, 255, 0), 'rect': (240, 20, 320, 100)},
-    {'name': 'blue', 'bgr': (255, 0, 0), 'rect': (350, 20, 430, 100)},
-    {'name': 'yellow', 'bgr': (0, 255, 255), 'rect': (460, 20, 540, 100)},
-    {'name': 'eraser', 'bgr': (255, 255, 255), 'rect': (570, 20, 650, 100)}
-]
+# Transformer that receives frames and overlays the persistent draw_layer
+class AirDrawTransformer(VideoTransformerBase):
+    def __init__(self):
+        # MediaPipe hands
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.6, min_tracking_confidence=0.6)
+        self.mp_draw = mp.solutions.drawing_utils
 
-SIZE_UI = [
-    {'name': 'S', 'size': 5, 'rect': (20, 120, 100, 200)},
-    {'name': 'M', 'size': 12, 'rect': (130, 120, 210, 200)},
-    {'name': 'L', 'size': 25, 'rect': (240, 120, 320, 200)}
-]
+        # Drawing state
+        self.draw_layer = None
+        self.lock = threading.Lock()
+        self.xp, self.yp = None, None
+        self.brush_size = 8
+        self.color = (0, 59, 255)  # BGR for OpenCV default red-ish
+        self.tool = "Brush"
 
-SHAPE_UI = [
-    {'name': 'rect', 'rect': (20, 220, 120, 300)},
-    {'name': 'circle', 'rect': (140, 220, 240, 300)},
-    {'name': 'line', 'rect': (260, 220, 360, 300)}
-]
+        # Undo/redo
+        self.history = []
+        self.redo_stack = []
+        self.HISTORY_LIMIT = 20
 
-# Functions
-def save_history(layer):
-    history.append(layer.copy())
-    redo_stack.clear()
+        # Track requests from Streamlit UI
+        self._last_ui_state = {"save_counter": 0, "clear_counter": 0, "brush_size": 8, "color_hex": "#ff3b30", "tool": "Brush"}
 
-def undo(layer):
-    global history, redo_stack
-    if len(history) > 1:
-        redo_stack.append(history.pop())
-        layer[:] = history[-1].copy()
+    def _hex_to_bgr(self, hexcol):
+        h = hexcol.lstrip('#')
+        r, g, b = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        return (b, g, r)
 
-def redo(layer):
-    global history, redo_stack
-    if redo_stack:
-        layer[:] = redo_stack.pop()
-        history.append(layer.copy())
+    def save_history(self):
+        with self.lock:
+            if self.draw_layer is not None:
+                self.history.append(self.draw_layer.copy())
+                if len(self.history) > self.HISTORY_LIMIT:
+                    self.history.pop(0)
+                self.redo_stack.clear()
 
-def draw_ui(frame):
-    # Draw color palette
-    for item in PALETTE:
-        x1, y1, x2, y2 = item['rect']
-        cv2.rectangle(frame, (x1,y1), (x2,y2), item['bgr'], -1)
-        cv2.rectangle(frame, (x1,y1), (x2,y2), (50,50,50), 2)
-        cv2.putText(frame, item['name'], (x1+5, y2-8), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0,0,0) if item['name']=='eraser' else (255,255,255), 2)
-    # Brush sizes
-    for item in SIZE_UI:
-        x1,y1,x2,y2 = item['rect']
-        cv2.rectangle(frame,(x1,y1),(x2,y2),(220,220,220),-1)
-        cv2.rectangle(frame,(x1,y1),(x2,y2),(80,80,80),2)
-        cv2.putText(frame, item['name'], (x1+10, y2-10), cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,0),2)
-        cx = x1 + (x2-x1)//2
-        cy = y1 + (y2-y1)//2
-        cv2.circle(frame,(cx,cy),item['size'],(0,0,0),-1)
-    # Shape buttons
-    for item in SHAPE_UI:
-        x1,y1,x2,y2 = item['rect']
-        cv2.rectangle(frame,(x1,y1),(x2,y2),(200,200,200),-1)
-        cv2.rectangle(frame,(x1,y1),(x2,y2),(80,80,80),2)
-        cv2.putText(frame,item['name'],(x1+8,y2-8),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,0),2)
+    def undo(self):
+        with self.lock:
+            if len(self.history) > 1:
+                self.redo_stack.append(self.history.pop())
+                self.draw_layer[:] = self.history[-1].copy()
 
-def fingers_up(hand_landmarks):
-    tips=[4,8,12,16,20]
-    fingers=[]
-    try: fingers.append(1 if hand_landmarks.landmark[tips[0]].x < hand_landmarks.landmark[tips[0]-1].x else 0)
-    except: fingers.append(0)
-    for id in range(1,5):
-        try: fingers.append(1 if hand_landmarks.landmark[tips[id]].y < hand_landmarks.landmark[tips[id]-2].y else 0)
-        except: fingers.append(0)
-    return fingers
+    def redo(self):
+        with self.lock:
+            if self.redo_stack:
+                item = self.redo_stack.pop()
+                self.history.append(item.copy())
+                self.draw_layer[:] = item.copy()
 
-# Main Loop
-cap = cv2.VideoCapture(0)
-cap.set(3,CAM_WIDTH)
-cap.set(4,CAM_HEIGHT)
-draw_layer = None
+    def clear(self):
+        with self.lock:
+            if self.draw_layer is not None:
+                self.draw_layer[:] = 0
+                self.save_history()
 
-print("AR Air Paint - Press 'q' to quit, 's' to save, 'l' to load, 'u' undo, 'r' redo, 'c' clear, '1/2/3' brush types")
-
-while True:
-    ret, frame = cap.read()
-    if not ret: break
-    frame = cv2.flip(frame,1)
-    if draw_layer is None:
-        draw_layer = np.zeros_like(frame)
-
-    h,w,_ = frame.shape
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    res = hands.process(frame_rgb)
-
-    canvas = frame.copy()
-    all_fingers_down = False
-
-    if res.multi_hand_landmarks:
-        for handLms in res.multi_hand_landmarks:
-            mp_draw.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
-            index = handLms.landmark[8]
-            mx,my = int(index.x*w), int(index.y*h)
-            fingers = fingers_up(handLms)
-            all_fingers_down = sum(fingers)==0
-
-            # Selection mode (Index + Middle)
-            if fingers[1]==1 and fingers[2]==1:
-                xp,yp=None,None
-                for item in PALETTE:
-                    x1,y1,x2,y2 = item['rect']
-                    if x1<=mx<=x2 and y1<=my<=y2:
-                        color = item['bgr']
-                        tool = 'eraser' if item['name']=='eraser' else 'brush'
-                        save_history(draw_layer)
-                for item in SIZE_UI:
-                    x1,y1,x2,y2 = item['rect']
-                    if x1<=mx<=x2 and y1<=my<=y2:
-                        brush_size = item['size']
-                        eraser_size = max(brush_size*4,30)
-                        save_history(draw_layer)
-                for item in SHAPE_UI:
-                    x1,y1,x2,y2 = item['rect']
-                    if x1<=mx<=x2 and y1<=my<=y2:
-                        shape_type = item['name']
-                        tool = 'shape'
-                        shape_start = None
-                        drawing_shape=False
-                        save_history(draw_layer)
-
-            # Only switch tool if NOT currently using brush or eraser manually
-            if tool not in ['brush', 'eraser']:
-                if sum(fingers) == 2 and fingers[1] == 1 and fingers[2] == 1:  # rectangle
-                    tool = 'shape'; shape_type = 'rect'
-                elif fingers[1] == 1 and fingers[0] == 1:  # circle
-                    tool = 'shape'; shape_type = 'circle'
-                elif fingers[1] == 1 and sum(fingers) == 1:  # line
-                    tool = 'shape'; shape_type = 'line'
-
-            # Drawing
-            if fingers[1]==1:
-                if xp is None or yp is None:
-                    xp,yp = mx,my
-                    if tool=='shape' and not drawing_shape:
-                        shape_start = (mx,my)
-                        drawing_shape=True
-
-                if tool=='brush':
-                    if brush_type=='normal':
-                        cv2.line(draw_layer,(xp,yp),(mx,my),color,brush_size)
-                    elif brush_type=='dotted':
-                        dist=int(np.hypot(mx-xp,my-yp))
-                        steps=max(dist//(brush_size*2),1)
-                        for i in range(steps+1):
-                            t=i/steps
-                            xi=int(xp+(mx-xp)*t)
-                            yi=int(yp+(my-yp)*t)
-                            cv2.circle(draw_layer,(xi,yi),max(1,brush_size//2),color,-1)
-                    elif brush_type=='calligraphy':
-                        angle=np.arctan2(my-yp,mx-xp)
-                        ox=int(np.cos(angle+np.pi/2)*brush_size/2)
-                        oy=int(np.sin(angle+np.pi/2)*brush_size/2)
-                        pts=np.array([[xp-ox,yp-oy],[xp+ox,yp+oy],[mx+ox,my+oy],[mx-ox,my-oy]])
-                        cv2.fillConvexPoly(draw_layer,pts,color)
-                    xp,yp=mx,my
-
-                elif tool=='eraser':
-                    cv2.line(draw_layer,(xp,yp),(mx,my),(0,0,0),eraser_size)
-                    xp,yp=mx,my
-
-                elif tool=='shape' and drawing_shape:
-                    temp = draw_layer.copy()
-                    x0,y0 = shape_start
-                    x1,y1 = mx,my
-                    if shape_type=='rect': cv2.rectangle(temp,(x0,y0),(x1,y1),color,brush_size)
-                    elif shape_type=='circle': cv2.circle(temp,(x0,y0),int(np.hypot(x1-x0,y1-y0)),color,brush_size)
-                    elif shape_type=='line': cv2.line(temp,(x0,y0),(x1,y1),color,brush_size)
-                    canvas = cv2.addWeighted(frame,1,temp,1,0)
+    def request_save_png(self):
+        # returns a numpy BGR image (the drawing alone) to be saved by main thread
+        with self.lock:
+            if self.draw_layer is not None:
+                return self.draw_layer.copy()
             else:
-                if tool=='shape' and drawing_shape and all_fingers_down:
-                    x0,y0 = shape_start
-                    x1,y1 = mx,my
-                    if shape_type=='rect': cv2.rectangle(draw_layer,(x0,y0),(x1,y1),color,brush_size)
-                    elif shape_type=='circle': cv2.circle(draw_layer,(x0,y0),int(np.hypot(x1-x0,y1-y0)),color,brush_size)
-                    elif shape_type=='line': cv2.line(draw_layer,(x0,y0),(x1,y1),color,brush_size)
-                    drawing_shape=False
-                    shape_start=None
-                    save_history(draw_layer)
-                xp,yp=None,None
+                return None
 
-    # Overlay drawing layer
-    canvas = cv2.addWeighted(canvas,1,draw_layer,1,0)
+    def update_ui_state(self, ui_state):
+        # Called from main thread to push UI changes
+        self._last_ui_state = ui_state
+        # apply brush size / color / tool changes
+        self.brush_size = int(ui_state.get("brush_size", self.brush_size))
+        self.color = self._hex_to_bgr(ui_state.get("color_hex", "#ff3b30"))
+        self.tool = ui_state.get("tool", self.tool)
 
-    # Draw UI
-    draw_ui(canvas)
+    def _fingers_up(self, hand_landmarks):
+        tips = [4, 8, 12, 16, 20]
+        fingers = []
+        try:
+            fingers.append(1 if hand_landmarks.landmark[tips[0]].x < hand_landmarks.landmark[tips[0]-1].x else 0)
+        except:
+            fingers.append(0)
+        for i in range(1,5):
+            try:
+                fingers.append(1 if hand_landmarks.landmark[tips[i]].y < hand_landmarks.landmark[tips[i]-2].y else 0)
+            except:
+                fingers.append(0)
+        return fingers
 
-    # Tool info
-    cv2.putText(canvas,f'Tool: {tool} | Brush: {brush_type} | Size: {brush_size}',
-                (20,CAM_HEIGHT-20),cv2.FONT_HERSHEY_SIMPLEX,0.7,(50,50,50),2)
+    def transform(self, frame: VideoFrame) -> VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        img = cv2.flip(img, 1)  # mirror to match webcam mirrors
+        h, w, _ = img.shape
 
-    cv2.imshow("AR Air Paint",canvas)
+        # Initialize draw_layer once we know frame size
+        with self.lock:
+            if self.draw_layer is None:
+                self.draw_layer = np.zeros_like(img)
+                self.history = [self.draw_layer.copy()]
 
-    key=cv2.waitKey(1)&0xFF
-    if key==27 or key==ord('q'): break
-    elif key==ord('s'): cv2.imwrite('drawing.png',draw_layer); print("Saved drawing.png")
-    elif key==ord('l') and os.path.exists('drawing.png'):
-        loaded=cv2.imread('drawing.png')
-        if loaded is not None: draw_layer=loaded.copy(); save_history(draw_layer); print("Loaded drawing.png")
-    elif key==ord('u'): undo(draw_layer)
-    elif key==ord('r'): redo(draw_layer)
-    elif key==ord('c'): draw_layer = np.zeros_like(frame); save_history(draw_layer)
-    elif key==ord('1'): brush_type='normal'
-    elif key==ord('2'): brush_type='dotted'
-    elif key==ord('3'): brush_type='calligraphy'
+        # Update UI-controlled params if changed
+        # (Main thread will call update_ui_state - but we also poll session_state every pass to be safe)
+        try:
+            ui = st.session_state
+            ui_state = {
+                "save_counter": ui.get("save_request", 0),
+                "clear_counter": ui.get("clear_request", 0),
+                "brush_size": ui.get("brush_size", self.brush_size),
+                "color_hex": ui.get("color_hex", "#ff3b30"),
+                "tool": ui.get("tool", "Brush"),
+            }
+            self.update_ui_state(ui_state)
+        except Exception:
+            pass
 
-cap.release()
-cv2.destroyAllWindows()
+        # Hand tracking
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        res = self.hands.process(img_rgb)
+        all_fingers_down = False
+
+        if res.multi_hand_landmarks:
+            for handLms in res.multi_hand_landmarks:
+                # mp drawing for debug (optional)
+                self.mp_draw.draw_landmarks(img, handLms, self.mp_hands.HAND_CONNECTIONS if hasattr(self, 'mp_hands') else None)
+
+                index = handLms.landmark[8]
+                mx, my = int(index.x * w), int(index.y * h)
+                fingers = self._fingers_up(handLms)
+                all_fingers_down = sum(fingers) == 0
+
+                # Drawing with index finger up
+                if fingers[1] == 1:
+                    if self.xp is None or self.yp is None:
+                        self.xp, self.yp = mx, my
+                    # draw onto draw_layer
+                    if self.tool == "Brush":
+                        cv2.line(self.draw_layer, (self.xp, self.yp), (mx, my), self.color, int(self.brush_size))
+                    else:  # Eraser
+                        cv2.line(self.draw_layer, (self.xp, self.yp), (mx, my), (0,0,0), int(max(self.brush_size*3, 20)))
+                    self.xp, self.yp = mx, my
+                else:
+                    # when user closes fist after drawing -> commit history
+                    if self.xp is not None and self.yp is not None:
+                        self.save_history()
+                    self.xp, self.yp = None, None
+
+        # Overlay draw_layer onto image
+        with self.lock:
+            overlay = cv2.addWeighted(img, 1.0, self.draw_layer, 1.0, 0)
+
+        # Handle clear request (from main streamlit UI)
+        try:
+            ui = st.session_state
+            if ui.get("clear_request", 0) != self._last_ui_state.get("clear_counter", 0):
+                self.clear()
+                self._last_ui_state["clear_counter"] = ui.get("clear_request", 0)
+        except Exception:
+            pass
+
+        # Return frame to browser
+        out_frame = VideoFrame.from_ndarray(overlay, format="bgr24")
+        return out_frame
+
+# Start webRTC streamer
+webrtc_ctx = webrtc_streamer(
+    key="airdraw",
+    rtc_configuration=RTC_CONFIGURATION,
+    video_transformer_factory=AirDrawTransformer,
+    media_stream_constraints={"video": True, "audio": False},
+    async_transform=True,
+)
+
+# Buttons that interact with transformer
+if webrtc_ctx.state.playing:
+    transformer = webrtc_ctx.video_transformer
+
+    # Update transformer UI state from the sidebar controls
+    ui_state = {
+        "brush_size": brush_size,
+        "color_hex": color_hex,
+        "tool": tool,
+        "save_counter": st.session_state.get("save_request", 0),
+        "clear_counter": st.session_state.get("clear_request", 0),
+    }
+    if transformer:
+        try:
+            transformer.update_ui_state(ui_state)
+        except Exception:
+            pass
+
+    # Undo / Redo / Save UI
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("Undo"):
+            if transformer:
+                transformer.undo()
+    with cols[1]:
+        if st.button("Redo"):
+            if transformer:
+                transformer.redo()
+    with cols[2]:
+        if st.button("Export PNG"):
+            if transformer:
+                img_to_save = transformer.request_save_png()
+                if img_to_save is not None:
+                    ts = int(time.time())
+                    fname = f"drawing_{ts}.png"
+                    cv2.imwrite(fname, img_to_save)
+                    st.success(f"Saved {fname}")
+                    st.download_button("Download PNG", data=open(fname, "rb").read(), file_name=fname, mime="image/png")
+
+else:
+    st.info("Waiting for WebRTC connection... click 'Allow' to give camera access in the browser popup.")
+
+st.write("If you run into build errors installing dependencies on Streamlit Cloud, see the notes in the README or fallback to the browser demo.")
